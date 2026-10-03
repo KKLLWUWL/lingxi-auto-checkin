@@ -19,13 +19,17 @@ if not exist "%PYEXE%" (
 set PYTHONIOENCODING=utf-8
 
 echo 方式一：通过任务计划 COM 接口注册...
+rem 静默模式：用 pythonw 拉起，开机后不会闪黑框，灵犀窗口也全程隐藏，
+rem 签到结果以系统通知告知。想看界面请把下面的 --install 换成 --install --visible
 "%PYEXE%" "%~dp0register_task.py" --install
 if not errorlevel 1 goto :ok
 
 echo.
 echo COM 方式失败（多半是缺 pywin32），改用 schtasks...
+set "PYWEXE=%PYEXE:python.exe=pythonw.exe%"
+if not exist "%PYWEXE%" set "PYWEXE=%PYEXE%"
 schtasks /create /tn "灵犀每日自动签到" ^
-  /tr "\"%PYEXE%\" \"%~dp0lingxi_checkin.py\" --wait 60 --retries 3 --port 19222" ^
+  /tr "\"%PYWEXE%\" \"%~dp0lingxi_checkin.py\" --wait 60 --retries 3 --port 19222" ^
   /sc onlogon /delay 0000:01 /f
 if errorlevel 1 (
     echo.

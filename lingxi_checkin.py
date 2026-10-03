@@ -27,12 +27,22 @@ Chrome DevTools Protocol 端口。我们通过这个正规通道去操作界面�
 3. 签到是调用界面上那个按钮完成（等价于你手动点一下），
    而不是伪造请求，符合产品规则。
 
+默认行为（后台静默）
+--------------------
+启动后立刻把自己从控制台摘下来（计划任务拉起时不会闪黑框），
+灵犀窗口一露面就隐藏（Electron 建窗有延迟，脚本会持续巡视到流程结束），
+全程无窗口干扰；签到达成后弹一条 Windows 右下角通知。
+调试时想看见界面，加 ``--visible`` 即可。
+
 用法
 ----
-    python lingxi_checkin.py                # 正常执行一次签到
+    python lingxi_checkin.py                # 静默执行一次签到（默认）
     python lingxi_checkin.py --dry-run      # 只判断不点，看当天状态
     python lingxi_checkin.py --dump         # 排障：导出界面/接口信息到 report/
     python lingxi_checkin.py --no-restart   # 已有一个带端口的实例时复用它
+    python lingxi_checkin.py --visible      # 不隐藏窗口，用于人工观察排障
+    python lingxi_checkin.py --no-notify    # 不弹桌面通知
+    python lingxi_checkin.py --test-notify  # 只发一条测试通知就退出
 
 退出码
 ------
@@ -49,12 +59,14 @@ Chrome DevTools Protocol 端口。我们通过这个正规通道去操作界面�
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as dt
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -66,6 +78,7 @@ except ImportError:  # pragma: no cover
     psutil = None  # type: ignore
 
 from cdp_mini import CdpError, CdpSession, http_json, iter_page_targets
+import notify
 
 # ==========================================================================
 # 配置区（一般不用改；也可通过命令行覆盖）
@@ -113,6 +126,18 @@ T_RESULT = 25
 # 退出码分界线：<= 这个都算「签到这件事已经达成」
 OK_ISH = 2
 
+# 重要教训：不要给灵犀加 Chromium 启动开关。
+# 试过 --disable-background-timer-throttling / --disable-renderer-backgrounding
+# 这类参数，灵犀会直接启动失败退出（端口永远起不来）。
+# 实测下来「纯隐藏窗口」就能正常工作：Chromium 的严格节流要到页面隐藏
+# 5 分钟后才生效，签到流程 1~2 分钟内就跑完了，够用。
+SILENT_LAUNCH_ARGS: list[str] = []
+
+# 全局开关（由命令行参数设置）
+NOTIFY_ENABLED = True          # 是否弹桌面通知
+SILENT = True                  # 是否静默（隐藏控制台 + 隐藏灵犀窗口）
+LAST_RECORD: dict = {}         # 最近一次执行的记录，供通知取文案
+
 
 # ==========================================================================
 # 日志
@@ -126,14 +151,18 @@ class Log:
 
     def __call__(self, msg: str, level: str = "INFO"):
         line = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] [{level}] {msg}"
-        if self.verbose:
+        # pythonw / 摘掉控制台之后 sys.stdout 可能是 None，print 会炸
+        if self.verbose and getattr(sys, "stdout", None) is not None:
             # 避免 Windows 控制台 GBK 打印 emoji/特殊字符炸掉
             try:
                 print(line, flush=True)
             except UnicodeEncodeError:
                 print(line.encode("gbk", "replace").decode("gbk"), flush=True)
-        self.fp.write(line + "\n")
-        self.fp.flush()
+        try:
+            self.fp.write(line + "\n")
+            self.fp.flush()
+        except Exception:            # 日志已关闭等，不该影响主流程
+            pass
 
     def close(self):
         try:
@@ -143,6 +172,96 @@ class Log:
 
 
 log = Log()
+
+
+# ==========================================================================
+# 静默运行：不弹控制台、不弹灵犀窗口
+# ==========================================================================
+SW_HIDE = 0
+SW_SHOW = 5
+
+
+def detach_console() -> bool:
+    """把本进程从控制台上摘下来——计划任务拉起 python 时那个黑框随之消失。
+
+    只影响自己：从 cmd 里手动运行时，cmd 自己的窗口不受影响。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not k32.GetConsoleWindow():
+            return False          # 本来就是 pythonw / 无控制台，不用处理
+
+        # 关键：必须先把「文件描述符」1/2 重定向到 nul，再释放控制台。
+        # 只换 sys.stdout 是不够的——fd 1/2 仍指向那个马上要消失的控制台，
+        # 之后 Popen 拉起灵犀时被它继承，灵犀会直接启动失败（端口永远起不来）。
+        dn = os.open(os.devnull, os.O_RDWR)
+        for fd in (1, 2):
+            try:
+                os.dup2(dn, fd)
+            except OSError:
+                pass
+        if dn > 2:
+            os.close(dn)
+        # 再把 Python 层的输出对象也换掉，免得 print 抛 OSError
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        return bool(k32.FreeConsole())
+    except Exception:             # noqa: BLE001
+        return False
+
+
+def hide_app_windows(pids: list[int] | None = None) -> int:
+    """隐藏属于灵犀的所有可见顶层窗口，返回本次新隐藏的窗口数。"""
+    if os.name != "nt":
+        return 0
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                         ctypes.c_void_p)
+    want = set(pids if pids is not None else list_pids())
+    hidden = 0
+
+    def cb(hwnd, _lparam):
+        nonlocal hidden
+        pid = ctypes.c_ulong()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) in want and u32.IsWindowVisible(hwnd):
+            u32.ShowWindow(hwnd, SW_HIDE)
+            hidden += 1
+        return True
+
+    u32.EnumWindows(EnumWindowsProc(cb), 0)
+    return hidden
+
+
+class WindowHider(threading.Thread):
+    """后台巡视线程：灵犀的窗口一露面就藏起来。
+
+    Electron 的主窗口、弹窗都是延迟创建的，只藏一次不够，
+    所以整个签到流程期间都保持巡视，直到 stop()。
+    """
+
+    def __init__(self, interval: float = 0.4):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.hidden = 0
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                n = hide_app_windows()
+                if n:
+                    self.hidden += n
+                    log(f"已隐藏灵犀窗口（累计 {self.hidden} 次）", "DEBUG")
+            except Exception:      # noqa: BLE001
+                pass
+            self._stop.wait(self.interval)
+
+    def stop(self, timeout: float = 1.0):
+        self._stop.set()
+        self.join(timeout)
 
 
 # ==========================================================================
@@ -264,7 +383,7 @@ def wait_port(port: int, timeout: float = T_PORT_READY) -> None:
     )
 
 
-def launch(exe: Path, port: int, restart: bool = True) -> int:
+def launch(exe: Path, port: int, restart: bool = True, silent: bool = True) -> int:
     """以调试端口启动灵犀，返回新进程 pid。"""
     if restart or list_pids():
         # MUSA_CDP_PORT 只在程序启动时读取，所以必须让旧实例先退出
@@ -276,6 +395,11 @@ def launch(exe: Path, port: int, restart: bool = True) -> int:
     env[CDP_ENV] = str(port)
     log(f"启动灵犀并开启调试端口 {port}: {exe}")
 
+    cmd = [str(exe)]
+    if silent and SILENT_LAUNCH_ARGS:
+        cmd += SILENT_LAUNCH_ARGS
+        log(f"静默模式，附加启动参数: {' '.join(SILENT_LAUNCH_ARGS)}")
+
     # Windows：让子进程有正常窗口，并脱离当前控制台进程组（避免被父进程回收）
     startupinfo = None
     if hasattr(subprocess, "STARTUPINFO"):
@@ -286,7 +410,7 @@ def launch(exe: Path, port: int, restart: bool = True) -> int:
         creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
     proc = subprocess.Popen(
-        [str(exe)],
+        cmd,
         cwd=str(exe.parent),
         env=env,
         close_fds=True,
@@ -294,8 +418,46 @@ def launch(exe: Path, port: int, restart: bool = True) -> int:
         creationflags=creationflags,
     )
     log(f"已创建进程 pid={proc.pid}")
+
+    # 兜底：有些运行环境（非交互桌面、受限令牌，比如从某些终端/脚本里拉起）
+    # 下 Electron 要么启动即退出、要么活着但没开端口。
+    # 这两种情况都改用 ShellExecute 再试一次——它走的是和资源管理器
+    # 一样的启动路径，成功率更高，也更贴近「用户双击」的场景。
+    if proc.poll() is not None:
+        log("灵犀进程启动后很快退出，改用 ShellExecute 重试", "WARN")
+        _shellexecute(exe)
+    elif not _port_alive(port, wait=12):
+        log("常规方式启动后 12 秒端口仍未就绪，改用 ShellExecute 重试", "WARN")
+        _shellexecute(exe)
+
     wait_port(port)
     return proc.pid
+
+
+def _port_alive(port: int, wait: float = 12.0) -> bool:
+    """短暂探一下端口是否在 wait 秒内起来了（只探，不报错）。"""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        try:
+            http_json(port, "/json/version", timeout=2)
+            return True
+        except Exception:        # noqa: BLE001
+            time.sleep(1.0)
+    return False
+
+
+def _shellexecute(exe: Path) -> bool:
+    """用 ShellExecuteW 启动程序（等价于在资源管理器里双击）。"""
+    if os.name != "nt":
+        return False
+    try:
+        # ShellExecute 会继承本进程环境，MUSA_CDP_PORT 已在 launch() 里设好
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "open", str(exe), None, str(exe.parent), 0)   # 0 = SW_HIDE
+        return int(rc) > 32
+    except Exception as e:                                       # noqa: BLE001
+        log(f"ShellExecute 调用失败: {e}", "WARN")
+        return False
 
 
 # ==========================================================================
@@ -493,8 +655,11 @@ def wait_task_center(session: CdpSession, port: int) -> dict:
             return probe
         time.sleep(1.0)
 
-    session.screenshot(str(SHOT_DIR / f"no_button_{dt.datetime.now():%H%M%S}.png"))
-    raise RuntimeError("任务中心里没找到签到按钮（已截图到 shots/，可用 --dump 进一步排查）")
+    try:
+        session.screenshot(str(SHOT_DIR / f"no_button_{dt.datetime.now():%H%M%S}.png"))
+    except Exception as e:        # noqa: BLE001
+        log(f"截图失败（窗口处于隐藏状态）: {e}", "WARN")
+    raise RuntimeError("任务中心里没找到签到按钮（可用 --visible --dump 进一步排查）")
 
 
 # ==========================================================================
@@ -560,6 +725,50 @@ def do_checkin(session: CdpSession) -> dict:
             log("面板出现「已签到」字样，判定成功")
             return {"ok": True, "state": "done", "probe": probe}
     return {"ok": False, "state": "unknown", "probe": last or {}}
+
+
+JS_CLOSE_PANEL = r"""
+(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const hasPanel = () => !!document.querySelector('.task-center-panel');
+  if (!hasPanel()) return JSON.stringify({ closed: true, how: 'none' });
+
+  // 1) 优先用官方 bridge 关掉设置面板
+  const api = (window.muse && window.muse.settings) ||
+              (window.lingxi && window.lingxi.settings);
+  for (const fn of ['closeSettings', 'close', 'hideSettings']) {
+    if (api && typeof api[fn] === 'function') {
+      try { await api[fn](); await wait(600); } catch (e) {}
+      if (!hasPanel()) return JSON.stringify({ closed: true, how: 'api:' + fn });
+    }
+  }
+
+  // 2) 点关闭按钮（class 里带 close 的小图标）
+  const btns = [...document.querySelectorAll('[class*="close"],[class*="Close"]')]
+    .filter(e => e.offsetParent !== null && e.getBoundingClientRect().width > 0 &&
+                 e.getBoundingClientRect().width < 80);
+  if (btns.length) {
+    btns[btns.length - 1].click();
+    await wait(700);
+    if (!hasPanel()) return JSON.stringify({ closed: true, how: 'click' });
+  }
+
+  // 3) 最后按 ESC
+  document.dispatchEvent(new KeyboardEvent('keydown',
+    { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+  await wait(700);
+  return JSON.stringify({ closed: !hasPanel(), how: 'esc' });
+})()
+"""
+
+
+def close_panel(session: CdpSession) -> None:
+    """收尾：把任务中心面板关掉，免得下次打开灵犀停在设置页。尽力而为。"""
+    try:
+        res = session.evaluate(JS_CLOSE_PANEL, await_promise=True)
+        log(f"关闭任务中心面板: {res}")
+    except Exception as e:        # noqa: BLE001
+        log(f"关闭面板失败（不影响结果）: {e}", "WARN")
 
 
 # ==========================================================================
@@ -702,6 +911,44 @@ def append_history(record: dict) -> None:
 
 
 # ==========================================================================
+# 桌面通知
+# ==========================================================================
+def notify_result(code: int, record: dict) -> None:
+    """按本次结果弹一条系统通知。签到达成报喜，没达成也让人知道要处理。"""
+    if not NOTIFY_ENABLED:
+        log("通知已关闭（--no-notify）")
+        return
+
+    detail = (record.get("detail") or "").strip()
+    result = record.get("result")
+
+    # 排障类用法不打扰
+    if result in ("dump_ok", "dry_run_todo"):
+        return
+
+    if code == 0 and result == "signed":
+        title, msg = "灵犀签到成功", detail or "今日积分已领取"
+    elif code == 2:
+        title = "灵犀今日已签到"
+        msg = "无需重复操作" + (f"（{detail}）" if detail else "")
+    elif code == 3:
+        title, msg = "灵犀自动签到未完成", "未检测到登录状态，请手动登录一次"
+    elif code == 4:
+        title, msg = "灵犀自动签到未完成", "没找到签到按钮，界面可能已改版"
+    elif code == 5:
+        title, msg = "灵犀自动签到未完成", "点了签到但没看到成功反馈，请手动确认"
+    else:
+        title = "灵犀自动签到未成功"
+        msg = f"退出码 {code}：{detail[:60] or '见 logs 目录'}"
+
+    log(f"弹出通知: {title} / {msg}")
+    try:
+        notify.notify(title, msg)
+    except Exception as e:        # noqa: BLE001
+        log(f"通知发送异常（不影响退出码）: {e}", "WARN")
+
+
+# ==========================================================================
 # 主流程
 # ==========================================================================
 def main(argv: list[str] | None = None) -> int:
@@ -722,7 +969,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--retries", type=int, default=1, help="失败后总共尝试几次")
     ap.add_argument("--retry-interval", type=float, default=180,
                     help="两次尝试之间等待的秒数")
+    ap.add_argument("--visible", action="store_true",
+                    help="不隐藏灵犀窗口、不摘控制台（排障观察用）")
+    ap.add_argument("--no-notify", action="store_true", help="不弹桌面通知")
+    ap.add_argument("--test-notify", action="store_true",
+                    help="只发一条测试通知后退出")
     args = ap.parse_args(argv)
+
+    global NOTIFY_ENABLED, SILENT
+    NOTIFY_ENABLED = not args.no_notify
+    SILENT = not args.visible
+
+    if args.test_notify:
+        ok = notify.notify("灵犀自动签到 · 测试", "看到这条说明通知通道正常")
+        print("通知已发送" if ok else "通知发送失败")
+        return 0 if ok else 1
+
+    if SILENT:
+        # 越早摘掉控制台越好：连 --wait 那几十秒都不会有黑框
+        log.verbose = False
+        detach_console()
 
     if args.wait > 0:
         log(f"按要求先等待 {args.wait:.0f} 秒再开始")
@@ -730,17 +996,23 @@ def main(argv: list[str] | None = None) -> int:
 
     # 单次失败就到这里为止（dump / dry-run 这类交互用法不该反复重试）
     if args.retries <= 1:
-        return run_once(args)
+        code = run_once(args)
+        notify_result(code, LAST_RECORD)
+        log.close()
+        return code
 
+    # 重试期间保持安静：只有最后一次（成功提前结束的那次也算）才弹通知
     last = 1
     for i in range(1, args.retries + 1):
         log(f"===== 第 {i}/{args.retries} 次尝试 =====")
         last = run_once(args)
         if last <= OK_ISH:
-            return last
+            break
         if i < args.retries:
             log(f"本次未成功（退出码 {last}），等待 {args.retry_interval:.0f} 秒后重试")
             time.sleep(args.retry_interval)
+    notify_result(last, LAST_RECORD)
+    log.close()
     return last
 
 
@@ -749,6 +1021,8 @@ def run_once(args) -> int:
     started = time.time()
     SHOT_DIR.mkdir(parents=True, exist_ok=True)
     code = 1
+    hider: WindowHider | None = None
+    session: CdpSession | None = None
     record: dict = {"time": dt.datetime.now().isoformat(timespec="seconds"),
                     "result": None, "detail": ""}
     try:
@@ -765,7 +1039,13 @@ def run_once(args) -> int:
                 log("指定端口不通，仍需重启", "WARN")
 
         if need_launch:
-            launch(exe, args.port, restart=not args.no_restart)
+            launch(exe, args.port, restart=not args.no_restart, silent=SILENT)
+
+        # 静默模式下开窗即隐藏：从这里一直守到流程结束
+        if SILENT:
+            hider = WindowHider()
+            hider.start()
+            log("已启动窗口隐藏巡视")
 
         session, target = pick_main_session(args.port)
 
@@ -800,8 +1080,11 @@ def run_once(args) -> int:
                 code = 0
             else:
                 out = do_checkin(session)
-                session.screenshot(
-                    str(SHOT_DIR / f"after_{dt.datetime.now():%H%M%S}.png"))
+                try:
+                    session.screenshot(
+                        str(SHOT_DIR / f"after_{dt.datetime.now():%H%M%S}.png"))
+                except Exception as e:    # noqa: BLE001
+                    log(f"截图失败（窗口处于隐藏状态，不影响结果）: {e}", "WARN")
                 if out["ok"]:
                     record.update(result="signed", detail=str(out["probe"].get("text")))
                     log("签到完成")
@@ -816,7 +1099,10 @@ def run_once(args) -> int:
             log("无法判读签到状态，请运行 --dump 导出界面信息", "ERROR")
             code = 4
 
+        # 收尾：把任务中心面板关掉，下次打开灵犀不会停在设置页
+        close_panel(session)
         session.close()
+        session = None
     except FileNotFoundError as e:
         record.update(result="error", detail=str(e))
         log(str(e), "ERROR")
@@ -834,10 +1120,21 @@ def run_once(args) -> int:
         log(f"未预期异常: {e}\n{traceback.format_exc()}", "ERROR")
         code = 1
     finally:
+        if hider is not None:
+            hider.stop()
+        if session is not None:
+            try:
+                session.close()
+            except Exception:      # noqa: BLE001
+                pass
         record["elapsed"] = round(time.time() - started, 1)
+        global LAST_RECORD
+        LAST_RECORD = record
         append_history(record)
+        # 注意：这里不要 log.close()。通知是在 run_once 之后才发的，
+        # 提前关掉日志会让 notify_result 里的 log() 抛异常，
+        # 进而把退出码搅成 1、通知也发不出去。统一由 main 收尾时关闭。
         log(f"结束，退出码={code}，用时 {record['elapsed']}s")
-        log.close()
     return code
 
 

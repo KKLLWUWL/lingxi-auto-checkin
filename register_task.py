@@ -97,24 +97,38 @@ def task_xml(runner: Path) -> str:
 </Task>"""
 
 
-def _pick_python() -> str:
-    """挑一个能用的解释器：先脚本同目录/常见虚拟环境，再回落到 PATH 里的 python。"""
-    candidates = [
+def _pick_python(windowed: bool = True) -> str:
+    """挑一个能用的解释器：先脚本同目录/常见虚拟环境，再回落到 PATH 里的 python。
+
+    windowed=True 时优先挑 pythonw.exe——它天生没有控制台窗口，
+    配合 lingxi_checkin.py 自带的「摘控制台」逻辑，双保险不闪黑框。
+    """
+    bases = [
         BASE_DIR / ".venv/Scripts/python.exe",
+        Path(sys.executable),          # 当前解释器（发布版不写死任何本机路径）
     ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return sys.executable or "python"
+    for c in bases:
+        if not c.exists():
+            continue
+        if windowed:
+            w = c.with_name("pythonw.exe")
+            if w.exists():
+                return str(w)
+        return str(c)
+    return "pythonw" if windowed else "python"
 
 
-def install(python_exe: str | None = None, wait: int = 60, retries: int = 3) -> int:
+def install(python_exe: str | None = None, wait: int = 60, retries: int = 3,
+            visible: bool = False) -> int:
     """注册任务。
 
     直接调用 Python 而不是再包一层 .bat —— 少一层 %{}~dp0 与代码页的麻烦，
     等待与重试交给 lingxi_checkin.py 的 --wait / --retries 处理。
+
+    visible=False（默认）时用 pythonw 拉起，全程无窗口；
+    签到结果通过系统通知告知。
     """
-    python_exe = python_exe or _pick_python()
+    python_exe = python_exe or _pick_python(windowed=not visible)
     script = BASE_DIR / "lingxi_checkin.py"
     if not script.exists():
         print(f"[错误] 找不到主脚本: {script}")
@@ -143,7 +157,8 @@ def install(python_exe: str | None = None, wait: int = 60, retries: int = 3) -> 
     action.Path = python_exe
     action.WorkingDirectory = str(BASE_DIR)
     action.Arguments = (f'"{script}" --wait {wait} --retries {retries}'
-                        f' --port {PORT_DEFAULT}')
+                        f' --port {PORT_DEFAULT}'
+                        + (' --visible' if visible else ''))
 
     # 其余运行策略
     st = taskdef.Settings
@@ -175,8 +190,11 @@ def install(python_exe: str | None = None, wait: int = 60, retries: int = 3) -> 
         print(f"[OK] 已注册任务: {TASK_NAME}")
         print(f"     解释器 : {python_exe}")
         print(f"     脚本   : {script}")
-        print(f"     参数   : --wait {wait} --retries {retries} --port {PORT_DEFAULT}")
+        print(f"     参数   : --wait {wait} --retries {retries} --port {PORT_DEFAULT}"
+              + (" --visible" if visible else " (静默)"))
         print("     触发器 : 每次登录时（延迟 60 秒）")
+        print("     结果   : 桌面通知；窗口全程隐藏" if not visible
+              else "     结果   : 显示灵犀窗口，便于观察")
         print(f"     日志   : {BASE_DIR / 'logs'}")
         return 0
     except Exception as e:  # noqa: BLE001
@@ -238,11 +256,13 @@ def main() -> int:
     g.add_argument("--uninstall", action="store_true")
     g.add_argument("--run", action="store_true")
     g.add_argument("--status", action="store_true")
+    ap.add_argument("--visible", action="store_true",
+                    help="注册成可见模式（排障用：会显示灵犀窗口）")
     args = ap.parse_args()
 
     try:
         if args.install:
-            return install()
+            return install(visible=args.visible)
         if args.uninstall:
             return uninstall()
         if args.run:

@@ -17,6 +17,9 @@ echo   1) 关闭正在运行的灵犀，用内置调试端口重新启动它
 echo   2) 连上去导出 interface / 按钮信息到 report\
 echo   3) 读出当天签到状态，但不会真的点签到
 echo.
+echo 说明：这里特意加 --visible 让界面露出来，好看得见、截得了图。
+echo       日常自动运行是静默的（无黑框、无窗口），见 2_注册开机自启.bat
+echo.
 echo 注意：灵犀会被重启一次，未保存的对话草稿可能丢失。
 echo.
 pause
@@ -35,7 +38,7 @@ echo 使用解释器: %PYEXE%
 echo.
 
 set PYTHONIOENCODING=utf-8
-"%PYEXE%" "%~dp0lingxi_checkin.py" --dump --dry-run
+"%PYEXE%" "%~dp0lingxi_checkin.py" --dump --dry-run --visible
 set RC=%errorlevel%
 
 echo.
