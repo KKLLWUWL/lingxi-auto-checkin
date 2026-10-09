@@ -31,8 +31,13 @@ Chrome DevTools Protocol 端口。我们通过这个正规通道去操作界面�
 --------------------
 启动后立刻把自己从控制台摘下来（计划任务拉起时不会闪黑框），
 灵犀窗口一露面就隐藏（Electron 建窗有延迟，脚本会持续巡视到流程结束），
-全程无窗口干扰；签到达成后弹一条 Windows 右下角通知。
-调试时想看见界面，加 ``--visible`` 即可。
+全程无窗口干扰；签到完成后把灵犀整个退出（不留在托盘），
+再弹一条 Windows 右下角通知，随后脚本自己结束。
+
+退出顺序是「先礼后兵」：调它自己的退出接口 → 给窗口发 WM_CLOSE
+让它走正常关闭流程 → 还不退（缩托盘的典型表现）才结束进程。
+
+调试时想看见界面，加 ``--visible``；想让灵犀继续开着，加 ``--no-quit``。
 
 用法
 ----
@@ -41,6 +46,7 @@ Chrome DevTools Protocol 端口。我们通过这个正规通道去操作界面�
     python lingxi_checkin.py --dump         # 排障：导出界面/接口信息到 report/
     python lingxi_checkin.py --no-restart   # 已有一个带端口的实例时复用它
     python lingxi_checkin.py --visible      # 不隐藏窗口，用于人工观察排障
+    python lingxi_checkin.py --no-quit      # 签到后不退出灵犀，让它继续开着
     python lingxi_checkin.py --no-notify    # 不弹桌面通知
     python lingxi_checkin.py --test-notify  # 只发一条测试通知就退出
 
@@ -136,6 +142,7 @@ SILENT_LAUNCH_ARGS: list[str] = []
 # 全局开关（由命令行参数设置）
 NOTIFY_ENABLED = True          # 是否弹桌面通知
 SILENT = True                  # 是否静默（隐藏控制台 + 隐藏灵犀窗口）
+QUIT_AFTER_DONE = True         # 签到完成后是否退出灵犀（默认退出）
 LAST_RECORD: dict = {}         # 最近一次执行的记录，供通知取文案
 
 
@@ -727,6 +734,92 @@ def do_checkin(session: CdpSession) -> dict:
     return {"ok": False, "state": "unknown", "probe": last or {}}
 
 
+JS_TRY_QUIT = r"""
+(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const tried = [];
+  const roots = [window.muse, window.lingxi].filter(Boolean);
+  const call = async (name, fn) => {
+    try { await fn(); tried.push({ name, ok: true }); }
+    catch (e) { tried.push({ name, ok: false, err: String(e).slice(0, 60) }); }
+  };
+  for (const root of roots) {
+    const app = root.app || root.application || root.base;
+    if (app) {
+      for (const fn of ['quit', 'exit', 'closeApp', 'close']) {
+        if (typeof app[fn] === 'function') await call('app.' + fn, () => app[fn]());
+      }
+    }
+    for (const fn of ['quit', 'exit']) {
+      if (typeof root[fn] === 'function') await call('root.' + fn, () => root[fn]());
+    }
+  }
+  try { window.close(); tried.push({ name: 'window.close', ok: true }); }
+  catch (e) { tried.push({ name: 'window.close', ok: false }); }
+  await wait(600);
+  return JSON.stringify({ tried });
+})()
+"""
+
+# ==========================================================================
+# 收尾：签到完成后退出灵犀
+# ==========================================================================
+WM_CLOSE = 0x0010
+
+
+def post_close_to_lingxi() -> int:
+    """给灵犀的所有顶层窗口发 WM_CLOSE，让它走自己的关闭流程（比强杀体面）。
+
+    窗口此刻是隐藏的，但隐藏窗口照样收得到消息。
+    """
+    if os.name != "nt":
+        return 0
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                         ctypes.c_void_p)
+    want = set(list_pids())
+    sent = 0
+
+    def cb(hwnd, _lparam):
+        nonlocal sent
+        pid = ctypes.c_ulong()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) in want:
+            u32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            sent += 1
+        return True
+
+    u32.EnumWindows(EnumWindowsProc(cb), 0)
+    return sent
+
+
+def quit_after_done(timeout: float = 8.0) -> bool:
+    """签到完成后把灵犀整个退出，而不是缩在托盘里。"""
+    pids = list_pids()
+    if not pids:
+        log("灵犀当前没有在运行")
+        return True
+
+    log(f"准备退出灵犀，当前进程: {pids}")
+    sent = post_close_to_lingxi()
+    log(f"已向 {sent} 个窗口发送 WM_CLOSE")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline and list_pids():
+        time.sleep(0.5)
+    if not list_pids():
+        log("灵犀已自行退出")
+        return True
+
+    # 不少 Electron 应用收到 WM_CLOSE 只是缩到托盘，进程还在 —— 那就结束进程
+    log("WM_CLOSE 之后进程仍在（多半是缩到托盘了），改为结束进程", "WARN")
+    quit_lingxi()
+    ok = not list_pids()
+    if not ok:
+        log("警告：仍有灵犀进程残留", "WARN")
+    return ok
+
+
 JS_CLOSE_PANEL = r"""
 (async () => {
   const wait = ms => new Promise(r => setTimeout(r, ms));
@@ -769,6 +862,15 @@ def close_panel(session: CdpSession) -> None:
         log(f"关闭任务中心面板: {res}")
     except Exception as e:        # noqa: BLE001
         log(f"关闭面板失败（不影响结果）: {e}", "WARN")
+
+
+def try_quit_via_bridge(session: CdpSession) -> None:
+    """先礼后兵：让灵犀自己调退出接口，失败了后面还有 WM_CLOSE 和结束进程。"""
+    try:
+        res = session.evaluate(JS_TRY_QUIT, await_promise=True)
+        log(f"尝试调用灵犀退出接口: {res}")
+    except Exception as e:        # noqa: BLE001
+        log(f"调用退出接口失败（后续用 WM_CLOSE 兜底）: {e}", "WARN")
 
 
 # ==========================================================================
@@ -972,13 +1074,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--visible", action="store_true",
                     help="不隐藏灵犀窗口、不摘控制台（排障观察用）")
     ap.add_argument("--no-notify", action="store_true", help="不弹桌面通知")
+    ap.add_argument("--no-quit", action="store_true",
+                    help="签到完成后不退出灵犀（默认会退出）")
     ap.add_argument("--test-notify", action="store_true",
                     help="只发一条测试通知后退出")
     args = ap.parse_args(argv)
 
-    global NOTIFY_ENABLED, SILENT
+    global NOTIFY_ENABLED, SILENT, QUIT_AFTER_DONE
     NOTIFY_ENABLED = not args.no_notify
     SILENT = not args.visible
+    QUIT_AFTER_DONE = not args.no_quit
 
     if args.test_notify:
         ok = notify.notify("灵犀自动签到 · 测试", "看到这条说明通知通道正常")
@@ -1101,8 +1206,21 @@ def run_once(args) -> int:
 
         # 收尾：把任务中心面板关掉，下次打开灵犀不会停在设置页
         close_panel(session)
-        session.close()
-        session = None
+
+        # 签到这件事已经办完，按用户要求把灵犀整个退出，不留在托盘里。
+        # --dump / --dry-run 属于排障用法，界面还得留着看，所以不退出。
+        # code <= OK_ISH 表示「签到这件事已经达成」；失败时留着灵犀，
+        # 方便你自己进去手动点一下。排障模式同理。
+        if QUIT_AFTER_DONE and code <= OK_ISH and not (args.dry_run or args.dump):
+            try_quit_via_bridge(session)
+            session.close()
+            session = None
+            quit_after_done()
+        else:
+            log(f"本次不退出灵犀（退出码 {code}"
+                + ("，排障模式" if (args.dry_run or args.dump) else "") + "）")
+            session.close()
+            session = None
     except FileNotFoundError as e:
         record.update(result="error", detail=str(e))
         log(str(e), "ERROR")
